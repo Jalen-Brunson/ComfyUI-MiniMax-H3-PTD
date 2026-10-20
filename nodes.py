@@ -22,19 +22,21 @@ try:
     from .pdd_heads import (
         AUDIO_SHIFT, VIDEO_SHIFT, HeadBank, block_boundaries, check_partition_pairing,
         fine_sigmas, fuse_heads, make_pdd_final_forward, partition_from_name,
-        partition_off_envelope, validate_sigma_shifts,
+        partition_off_envelope, resolve_partition, validate_sigma_shifts,
     )
     from .ptd_core import (
-        PTDStack, attach_ptd_sidecar, make_ptd_wrapper, plan_modules, split_ptd_state_dict,
+        PTDStack, attach_ptd_sidecar, hop_map, make_ptd_wrapper, plan_modules,
+        split_ptd_state_dict,
     )
 except ImportError:
     from pdd_heads import (
         AUDIO_SHIFT, VIDEO_SHIFT, HeadBank, block_boundaries, check_partition_pairing,
         fine_sigmas, fuse_heads, make_pdd_final_forward, partition_from_name,
-        partition_off_envelope, validate_sigma_shifts,
+        partition_off_envelope, resolve_partition, validate_sigma_shifts,
     )
     from ptd_core import (
-        PTDStack, attach_ptd_sidecar, make_ptd_wrapper, plan_modules, split_ptd_state_dict,
+        PTDStack, attach_ptd_sidecar, hop_map, make_ptd_wrapper, plan_modules,
+        split_ptd_state_dict,
     )
 
 WRAPPER_KEY = "minimax_h3_ptd"
@@ -128,6 +130,17 @@ class MiniMaxH3PTDApply:
                 "pin_memory": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Pin the CPU stack (streamed only): faster per-step H2D."}),
+                # appended last on purpose: inserting a widget mid-list shifts the
+                # values of every already-saved graph
+                "nfe": (["auto", "8", "6", "4", "10", "12"], {
+                    "default": "auto",
+                    "tooltip": "auto = the file's ptd_num_hops, the ONLY configuration PTD was "
+                               "distilled for. Anything else re-partitions the 32-step grid and "
+                               "each step falls back to the hop trained for the sigma region it "
+                               "starts in (8 hops at nfe 4 -> hops 0,2,4,6). Experiment only."}),
+                "allow_off_envelope": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Permit block sizes the PDD heads never saw. Expect heavy noise."}),
             },
         }
 
@@ -137,7 +150,8 @@ class MiniMaxH3PTDApply:
     CATEGORY = "advanced/model"
 
     def apply(self, model, ptd_file, lora_strength, head_strength, residency, on_off_grid,
-              enabled=True, bypass_sigmas=None, partition_check="error", pin_memory=True):
+              enabled=True, bypass_sigmas=None, partition_check="error", pin_memory=True,
+              nfe="auto", allow_off_envelope=False):
         if not enabled:
             if bypass_sigmas is None:
                 raise ValueError(
@@ -154,12 +168,31 @@ class MiniMaxH3PTDApply:
         plan = plan_modules(adapters, config, ptd_file)
         del adapters, sd
 
-        sizes = (config["block_size"],) * hops      # hop h <-> block h, uniform grid
-        off_env = partition_off_envelope(sizes)
+        # nfe == hops is the trained configuration: hop h <-> block h of the
+        # uniform 32/hops grid. An override re-partitions the grid and maps each
+        # block to the hop trained for the sigma region it starts in.
+        trained_block = config["block_size"]
+        sel = str(nfe or "auto").strip().lower()
+        want_nfe = hops if sel in ("", "auto") else int(sel)
+        sizes = resolve_partition(num_steps, want_nfe, trained_block=trained_block,
+                                  allow_off_envelope=allow_off_envelope)
+        hop_of_block = hop_map(sizes, trained_block, hops)
+
+        nfe_note = ""
+        if want_nfe != hops:
+            nfe_note = (
+                f"WARNING: nfe {want_nfe} != the file's {hops} hops. PTD was distilled ONLY for "
+                f"{hops} steps; blocks {','.join(map(str, sizes))} now run hops "
+                f"{','.join(map(str, hop_of_block))}, each the adapter trained for the sigma "
+                f"region that step starts in. Experiment -- A/B against nfe auto.\n")
+            logging.warning("MiniMaxH3PTDApply: %s", nfe_note.strip())
+
+        off_env = partition_off_envelope(sizes, trained_block=trained_block)
         off_env_note = ""
         if off_env:
-            off_env_note = (f"WARNING: block size {off_env} is outside the PDD head envelope "
-                            f"(4, 8) -- expect degradation.\n")
+            off_env_note = (f"WARNING: block size {off_env} is outside this file's PDD head "
+                            f"envelope ({trained_block}, {2 * trained_block}) -- expect heavy "
+                            f"noise.\n")
             logging.warning("MiniMaxH3PTDApply: %s", off_env_note.strip())
 
         meta = metadata or {}
@@ -209,14 +242,17 @@ class MiniMaxH3PTDApply:
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
             make_ptd_wrapper(holder, stack, bounds, on_off_grid,
                              lambda ex, to, kw: validate_sigma_shifts(
-                                 ex, to, kw, "MiniMaxH3PTDApply")))
+                                 ex, to, kw, "MiniMaxH3PTDApply"),
+                             hop_of_block=hop_of_block))
 
         sigmas = _sigmas_tensor(bounds)
         info = (
-            f"{off_env_note}"
+            f"{nfe_note}{off_env_note}"
             f"PTD: {ptd_file}\n"
-            f"grid {num_steps} fine steps -> {hops} hops x block {config['block_size']} "
-            f"(nfe {hops}, locked to ptd_num_hops)\n"
+            f"grid {num_steps} fine steps -> {hops} hops x block {trained_block} trained; "
+            f"running nfe {len(sizes)} blocks {','.join(map(str, sizes))} "
+            f"-> hops {','.join(map(str, hop_of_block))}"
+            f"{' (trained configuration)' if want_nfe == hops else ' (OVERRIDE)'}\n"
             f"{sidecar_note}\n"
             f"{fp_note}\n"
             f"heads: video {list(vW.shape)}, audio {list(aW.shape)} fp32, "
@@ -225,7 +261,8 @@ class MiniMaxH3PTDApply:
             f"recipe: euler + these sigmas, CFG 1.0, SigmaShift 12/3. No turbo LoRA, no "
             f"T8/EasyCache/Spectrum, no PDD Acc node in the same chain."
         )
-        logging.info("MiniMaxH3PTDApply: %s (%d hops) %s", ptd_file, hops, sidecar_note)
+        logging.info("MiniMaxH3PTDApply: %s (%d hops, nfe %d) %s",
+                     ptd_file, hops, len(sizes), sidecar_note)
         return (m, sigmas, info)
 
 

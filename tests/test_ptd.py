@@ -19,11 +19,11 @@ PACK = os.path.dirname(HERE)
 sys.path.insert(0, PACK)
 
 from ptd_core import (  # noqa: E402
-    PTDStack, first_tensor_device, make_ptd_wrapper, make_sidecar_forward, plan_modules,
-    read_ptd_config, split_ptd_state_dict,
+    PTDStack, first_tensor_device, hop_map, make_ptd_wrapper, make_sidecar_forward,
+    plan_modules, read_ptd_config, split_ptd_state_dict,
 )
 from pdd_heads import (  # noqa: E402
-    AUDIO_SHIFT, VIDEO_SHIFT, block_boundaries, validate_sigma_shifts,
+    AUDIO_SHIFT, VIDEO_SHIFT, block_boundaries, resolve_partition, validate_sigma_shifts,
 )
 
 PTD_FILE = "/workspace/ComfyUI/models/ptd/MiniMax-H3-Ref2VA-PTD-4Step.safetensors"
@@ -461,6 +461,68 @@ def test_sidecar_binds_device_when_wrapper_could_not():
     B = raw["transformer_blocks.0.attn.to_out.0.lora_up"][1].float()
     want = F.linear(x, base) + F.linear(F.linear(x, A), B)
     assert torch.allclose(got, want, rtol=1e-5, atol=1e-5), (got - want).abs().max()
+
+
+@test
+def test_hop_map_identity_at_trained_nfe():
+    """nfe == hops must stay exactly block h -> hop h (the distilled configuration)."""
+    for hops in (4, 8):
+        block = 32 // hops
+        sizes = resolve_partition(32, hops, trained_block=block)
+        assert hop_map(sizes, block, hops) == list(range(hops)), hops
+
+
+@test
+def test_hop_map_subsamples_the_trajectory():
+    """Fewer, larger steps take the hop trained for the sigma region they start in."""
+    # 8-hop file (trained block 4) run at nfe 4 -> blocks of 8 starting at 0,8,16,24
+    assert hop_map(resolve_partition(32, 4, trained_block=4), 4, 8) == [0, 2, 4, 6]
+    # non-uniform nfe 6 -> 8,8,4,4,4,4 starting at 0,8,16,20,24,28
+    assert hop_map(resolve_partition(32, 6, trained_block=4), 4, 8) == [0, 2, 4, 5, 6, 7]
+    # 4-hop file (trained block 8) run at nfe 4 == trained -> identity
+    assert hop_map(resolve_partition(32, 4, trained_block=8), 8, 4) == [0, 1, 2, 3]
+
+
+@test
+def test_hop_map_never_exceeds_the_hop_axis():
+    """A block starting past the last trained interval clamps instead of IndexError."""
+    hops, block = 4, 8
+    m = hop_map((2,) * 16, block, hops)
+    assert max(m) == hops - 1 and len(m) == 16, m
+    assert all(0 <= h < hops for h in m)
+
+
+@test
+def test_wrapper_routes_blocks_through_the_hop_map():
+    """An nfe override must arm the MAPPED hop, not the block index."""
+    _raw, _plan, stack, cfg = build(residency="resident")   # 4 hops in the fixture
+    hops = cfg["hops"]
+    sizes = (cfg["num_steps"] // 2,) * 2                     # nfe 2 over a 4-hop file
+    bounds = block_boundaries(cfg["num_steps"], sizes)
+    mapping = hop_map(sizes, cfg["num_steps"] // hops, hops)
+    assert mapping == [0, 2], mapping
+
+    class FakeDM:
+        sigma_shift_video, sigma_shift_audio = VIDEO_SHIFT, AUDIO_SHIFT
+
+    armed = []
+
+    class FakeExecutor:
+        class_obj = FakeDM()
+
+        def __call__(self, x, timestep, context, transformer_options, **kwargs):
+            armed.append(stack._hop)
+            return x
+
+    wrapper = make_ptd_wrapper(
+        __import__("types").SimpleNamespace(sigma_v=None, blk=None), stack, bounds, "error",
+        lambda ex, to, kw: validate_sigma_shifts(ex, to, kw, "MiniMaxH3PTDApply"),
+        hop_of_block=mapping)
+    for blk in range(len(sizes)):
+        wrapper(FakeExecutor(), [torch.zeros(1, 2), torch.zeros(1)],
+                torch.tensor([bounds[blk] * 1000.0]), None, {},
+                minimax_payload={"audio_scale": VIDEO_SHIFT / AUDIO_SHIFT})
+    assert armed == mapping, f"armed {armed}, expected {mapping}"
 
 
 if __name__ == "__main__":

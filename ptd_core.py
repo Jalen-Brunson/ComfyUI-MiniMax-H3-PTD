@@ -47,9 +47,9 @@ import torch
 import torch.nn.functional as F
 
 try:                                        # inside ComfyUI, as a package
-    from .pdd_heads import HEAD_KEYS, select_block
+    from .pdd_heads import HEAD_KEYS, partition_starts, select_block
 except ImportError:                          # as a plain module (tests, CLI)
-    from pdd_heads import HEAD_KEYS, select_block
+    from pdd_heads import HEAD_KEYS, partition_starts, select_block
 
 # diffusers suffix -> (comfy module suffix, kind). "qkv" is handled as a group.
 _PLAIN_MAP = (
@@ -398,8 +398,27 @@ def attach_ptd_sidecar(m, plan, stack, strength, logger=logging):
     return len(plan), note
 
 
-def make_ptd_wrapper(holder, stack, bounds, on_off_grid, validate_shifts):
-    """`stack` may be None (lora_strength 0.0 = head bank only, no trunk sidecar)."""
+def hop_map(sizes, trained_block, hops):
+    """Which hop drives each partition block.
+
+    Hop h was trained on the fine interval [h*trained_block, (h+1)*trained_block),
+    so a block STARTING at fine index s is served by hop s // trained_block --
+    the adapter trained for the part of the trajectory that step begins in.
+
+    With nfe == hops this is the identity (block h -> hop h), which is the only
+    configuration PTD was distilled for. With fewer, larger steps it subsamples
+    the trajectory: 8 hops at nfe 4 -> hops 0, 2, 4, 6. With a non-uniform
+    partition (nfe 6 -> 8,8,4,4,4,4) -> hops 0, 2, 4, 5, 6, 7.
+    """
+    return [min(int(s) // int(trained_block), hops - 1) for s in partition_starts(sizes)]
+
+
+def make_ptd_wrapper(holder, stack, bounds, on_off_grid, validate_shifts, hop_of_block=None):
+    """`stack` may be None (lora_strength 0.0 = head bank only, no trunk sidecar).
+
+    `hop_of_block` maps a partition block index to the hop that serves it; None
+    means the identity (nfe == hops).
+    """
     """DIFFUSION_MODEL wrapper: arm the hop BEFORE the trunk runs.
 
     The PDD head wrapper derives its block inside final_layer.forward, which runs
@@ -412,7 +431,8 @@ def make_ptd_wrapper(holder, stack, bounds, on_off_grid, validate_shifts):
         holder.sigma_v = float(timestep.flatten()[0]) / 1000.0
         holder.blk = select_block(holder.sigma_v, bounds, on_off_grid)
         if stack is not None:
-            stack.request_hop(holder.blk)
+            blk = holder.blk
+            stack.request_hop(blk if hop_of_block is None else hop_of_block[blk])
             # best effort only: H3 passes x as [video, audio], and under offload the
             # compute device can differ anyway -- each sidecar re-binds on its own input
             stack.bind(first_tensor_device(x))

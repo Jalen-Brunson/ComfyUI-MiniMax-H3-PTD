@@ -65,6 +65,61 @@ def validate_sigma_shifts(executor, transformer_options, kwargs, node="MiniMaxH3
             f"{VIDEO_SHIFT / AUDIO_SHIFT} -- mismatched sampling shifts.")
 
 
+DEFAULT_PARTITIONS = {
+    6: (8, 8, 4, 4, 4, 4),
+    # OFF-ENVELOPE experiment partitions (allow_off_envelope only): >8 blocks
+    # over 32 fine steps force sizes < 4. Size-2 blocks are placed at the LOW
+    # sigma end (later fine indices) so the off-grid starts sit where per-step
+    # displacement is smallest.
+    10: (4, 4, 4, 4, 4, 4, 2, 2, 2, 2),
+    12: (4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2),
+}
+
+
+def resolve_partition(num_steps, nfe, partition_text="", trained_block=4,
+                      allow_off_envelope=False):
+    """Return the tuple of block sizes (in fine steps) for an nfe / partition spec.
+
+    Sizes are restricted to {trained_block, 2*trained_block} (4 and 8 for the
+    released files): PDD heads are conditioned on trunk features from block
+    STARTS at multiples of L_min=trained_block with sizes up to L_max=2*L_min —
+    the two officially demonstrated groupings. Evaluating the trunk anywhere
+    else feeds the heads features they never trained on; empirically (fl2va,
+    nfe 32, 2026-08-27 reports + local repro) that renders as heavy noise, so
+    off-envelope partitions are rejected rather than allowed to degrade —
+    unless allow_off_envelope=True (explicit experiment opt-in; expect
+    degradation, the caller should surface a warning).
+    """
+    text = (partition_text or "").strip()
+    if text:
+        try:
+            sizes = tuple(int(p) for p in text.replace(" ", "").split(",") if p)
+        except ValueError:
+            raise ValueError(f"partition '{partition_text}' is not a comma-separated int list")
+        if any(s < 1 for s in sizes) or sum(sizes) != num_steps:
+            raise ValueError(f"partition {sizes} must be positive block sizes summing to "
+                             f"{num_steps} (got sum {sum(sizes)})")
+    elif num_steps % nfe == 0:
+        sizes = (num_steps // nfe,) * nfe
+    elif nfe in DEFAULT_PARTITIONS and sum(DEFAULT_PARTITIONS[nfe]) == num_steps:
+        sizes = DEFAULT_PARTITIONS[nfe]
+    else:
+        raise ValueError(f"nfe {nfe} does not divide pdd_num_steps {num_steps} and has no "
+                         f"default partition — supply one via the partition field (block sizes "
+                         f"summing to {num_steps}, e.g. '8,8,4,4,4,4')")
+    allowed = (trained_block, 2 * trained_block)
+    bad = sorted({s for s in sizes if s not in allowed})
+    if bad and not allow_off_envelope:
+        raise ValueError(
+            f"partition {sizes}: block sizes {bad} are outside the trained envelope "
+            f"{allowed}. PDD heads only ever saw trunk features from block starts on the "
+            f"L_min={trained_block} grid with blocks of {allowed[0]} or {allowed[1]} fine "
+            f"steps; anything else renders as heavy noise (verified on fl2va). Use nfe "
+            f"8/6/4 or a partition made of {allowed[0]}s and {allowed[1]}s — or set "
+            f"allow_off_envelope=True to run the experiment anyway.")
+    return sizes
+
+
 def partition_off_envelope(sizes, trained_block=4):
     """Sorted list of block sizes in `sizes` outside the trained envelope."""
     allowed = (trained_block, 2 * trained_block)

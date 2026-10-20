@@ -81,8 +81,31 @@ A worked graph is in [`example_workflows/`](example_workflows), derived from Com
 - No turbo/Lightning LoRA, no T8 BlockCache / EasyCache / Spectrum, and no PDD Acc node in the
   same chain.
 
-There is **no `nfe` or steps widget** — it is locked to the file's `ptd_num_hops`, because hop *h*
-was trained for block *h* of a uniform grid. Switching 8-step ↔ 4-step is just the dropdown.
+### Steps (`nfe`)
+
+Leave it on **`auto`**: the step count comes from the file's `ptd_num_hops`, because hop *h* was
+trained for block *h* of a uniform 32/hops grid. Switching 8-step ↔ 4-step is just the `ptd_file`
+dropdown.
+
+The override exists for experiments. Picking a different `nfe` re-partitions the 32-step grid and
+maps each block to **the hop trained for the sigma region that step starts in** — hop
+`block_start // trained_block`:
+
+| file | nfe | blocks | hops used |
+|---|---|---|---|
+| 8-step | `auto` (8) | 4,4,4,4,4,4,4,4 | 0,1,2,3,4,5,6,7 — trained |
+| 8-step | 4 | 8,8,8,8 | 0,2,4,6 |
+| 8-step | 6 | 8,8,4,4,4,4 | 0,2,4,5,6,7 |
+| 4-step | `auto` (4) | 8,8,8,8 | 0,1,2,3 — trained |
+| 4-step | 8 | 4,4,4,4,… | *refused* — blocks of 4 are outside this file's head envelope (8, 16) |
+
+Fewer, larger steps therefore subsample the same trajectory rather than mismatching hops to
+sigmas. It is still off the distilled configuration, so the node says so loudly in `info` and the
+log. Block sizes the PDD heads never saw are refused outright unless you also set
+`allow_off_envelope` (expect heavy noise).
+
+Both widgets are appended **last** deliberately — inserting them mid-list would shift the stored
+values of every already-saved graph.
 
 ### `residency`
 
