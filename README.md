@@ -50,7 +50,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/Jalen-Brunson/ComfyUI-MiniMax-H3-PTD
 ```
 
-No dependencies beyond ComfyUI. Needs a core new enough for the MiniMax-H3 carried-audio rework
+No dependencies beyond ComfyUI. Requires:
 ([ComfyUI#15243](https://github.com/comfyanonymous/ComfyUI/pull/15243), v0.33.0+); the node checks
 and refuses otherwise.
 
@@ -69,7 +69,7 @@ Put the checkpoints in `ComfyUI/models/ptd/`:
 A worked graph is in [`example_workflows/`](example_workflows), derived from ComfyUI's stock
 `video_minimax_h3_r2v` template.
 
-**The recipe is mandatory:**
+**Recommended Settings:**
 
 - **`euler`**, driven by the node's own `sigmas` output. Multi-stage samplers (`res_multistep`,
   `er_sde`, `dpmpp`, `res_*`) evaluate the model *between* the trained block boundaries, which the
