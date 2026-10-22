@@ -61,6 +61,12 @@ Put the checkpoints in `ComfyUI/models/ptd/`:
 | `MiniMax-H3-Ref2VA-PTD-8Step.safetensors` | 8 | 8 | 4 | 11.1 GB |
 | `MiniMax-H3-Ref2VA-PTD-4Step.safetensors` | 4 | 4 | 8 | 5.58 GB |
 
+The int8 copies in [nynxz/MiniMax-H3-PTD-LoRAs](https://huggingface.co/nynxz/MiniMax-H3-PTD-LoRAs)
+load too (`ptd_h3_ref2va_{4,8}step_int8`, and `ptd_h3_ref2va_refasymopd_8step_int8` — taobao's
+RefAsymOPD 8-step, trained for better backgrounds and sharpness): half the download, dequantized to
+the same bf16 layout at load (one float32 scale per row, ≤1.2% adapter error), so VRAM and RAM match
+the bf16 files. The EPFL fl2va files there are a different format (and base) and are refused.
+
 **Ref2VA only** — there is no FL2VA PTD release.
 
 ## Use

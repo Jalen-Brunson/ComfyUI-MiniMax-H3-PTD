@@ -100,9 +100,49 @@ def read_ptd_config(metadata, filename="<file>"):
     }
 
 
+def _compact_schema(metadata, filename):
+    """The int8 storage of nynxz/MiniMax-H3-PTD-LoRAs (ComfyUI-PTD-Compact `pdd.to_int8`), or None."""
+    raw = (metadata or {}).get("ptd_compact")
+    if raw is None:
+        return None
+    import json
+    try:
+        schema = json.loads(raw)
+    except ValueError:
+        schema = None
+    if not isinstance(schema, dict) or schema.get("schema") != 1 \
+            or schema.get("quant") != "int8 per-row":
+        raise ValueError(f"{filename}: unsupported ptd_compact storage {raw!r} -- only schema 1 "
+                         f"'int8 per-row' is known.")
+    return schema
+
+
+def _dequant_rows(q, scale, key, filename):
+    """int8 factor * its per-row float32 scale (one per row of the last-dim reduction) -> bf16.
+
+    Inverse of ComfyUI-PTD-Compact's `to_int8`: s = amax(|x|, -1) / 127, q = round(x / s).
+    bf16 is what PTDStack stores anyway, so nothing downstream changes.
+    """
+    if tuple(scale.shape) != tuple(q.shape[:-1]):
+        raise ValueError(f"{filename}: {key}_scale has shape {list(scale.shape)}, expected "
+                         f"{list(q.shape[:-1])} (one per row of {key})")
+    return (q.float() * scale.float().unsqueeze(-1)).to(torch.bfloat16)
+
+
 def split_ptd_state_dict(sd, metadata, filename="<file>"):
-    """-> (adapters, heads, config). adapters[diffusers_module] = (A[H,r,in], B[H,out,r])."""
+    """-> (adapters, heads, config). adapters[diffusers_module] = (A[H,r,in], B[H,out,r]).
+
+    Also takes the int8 files of nynxz/MiniMax-H3-PTD-LoRAs: int8 factors plus a
+    `<key>_scale` per row, dequantized here to the same bf16 layout.
+    """
     config = read_ptd_config(metadata, filename)
+    compact = _compact_schema(metadata, filename)
+    scales = {k[: -len("_scale")]: sd.pop(k) for k in list(sd)
+              if k.endswith((".lora_down_scale", ".lora_up_scale"))}
+    if scales and compact is None:
+        raise ValueError(f"{filename}: has per-row *_scale tensors but no ptd_compact metadata "
+                         f"-- unknown storage, refusing to load.")
+    config["storage"] = "int8 per-row, dequantized to bf16 at load" if compact else "bf16"
     for k in HEAD_KEYS:
         if k not in sd:
             raise ValueError(f"{filename} has no '{k}' -- not a PTD/PDD head bank?")
@@ -129,7 +169,15 @@ def split_ptd_state_dict(sd, metadata, filename="<file>"):
             raise ValueError(f"{filename}: {k} has shape {list(t.shape)}, expected a leading "
                              f"hop axis of {config['hops']} -- is this a de-hopped slice? "
                              f"(slice_ptd_hop.py output loads with MiniMaxH3PDDAccApply)")
+        scale = scales.pop(key, None)
+        if t.dtype == torch.int8:
+            if scale is None:
+                raise ValueError(f"{filename}: {k} is int8 but has no {k}_scale")
+            t = _dequant_rows(t, scale, k, filename)
+        elif scale is not None:
+            raise ValueError(f"{filename}: {k} is {t.dtype} but carries a {k}_scale")
         adapters.setdefault(mod, [None, None])[slot] = t
+    leftovers += [f"{k}_scale" for k in scales]          # scales whose factor never appeared
     if leftovers:
         raise ValueError(f"{filename}: {len(leftovers)} unrecognized keys, e.g. "
                          f"{sorted(leftovers)[:4]} -- format drift, refusing to load.")

@@ -525,6 +525,93 @@ def test_wrapper_routes_blocks_through_the_hop_map():
     assert armed == mapping, f"armed {armed}, expected {mapping}"
 
 
+PTD_INT8_FILE = "/workspace/ComfyUI/models/ptd/ptd_h3_ref2va_refasymopd_8step_int8.safetensors"
+COMPACT_PDD = os.path.join(os.path.dirname(PACK), "ComfyUI-PTD-Compact", "pdd.py")
+COMPACT_META = '{"schema": 1, "quant": "int8 per-row"}'
+
+
+def to_int8(sd, meta):
+    """The producer's own quantizer when ComfyUI-PTD-Compact is installed, else its formula."""
+    if os.path.isfile(COMPACT_PDD):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("compact_pdd", COMPACT_PDD)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.to_int8(sd, meta)
+    out = {}
+    for k, v in sd.items():
+        if k.endswith((".lora_down", ".lora_up")):
+            s = v.float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127
+            out[k] = (v.float() / s).round().clamp(-127, 127).to(torch.int8)
+            out[k + "_scale"] = s.squeeze(-1)
+        else:
+            out[k] = v
+    return out, dict(meta, ptd_compact=COMPACT_META)
+
+
+@test
+def test_int8_storage_dequantizes_like_the_producer():
+    sd, meta = synth_adapters()
+    q_sd, q_meta = to_int8({k: v.clone() for k, v in sd.items()}, meta)
+    assert any(v.dtype == torch.int8 for v in q_sd.values())
+    want = {k: (q_sd[k].float() * q_sd[k + "_scale"].float().unsqueeze(-1)).to(torch.bfloat16)
+            for k in q_sd if k.endswith((".lora_down", ".lora_up"))}
+    adapters, _heads, cfg = split_ptd_state_dict(dict(q_sd), q_meta)
+    assert cfg["storage"].startswith("int8"), cfg["storage"]
+    for mod, (A, B) in adapters.items():
+        for t, key in ((A, f"{mod}.lora_down"), (B, f"{mod}.lora_up")):
+            assert t.dtype == torch.bfloat16 and torch.equal(t, want[key]), key
+            err = (t.float() - sd[key].float()).norm() / sd[key].float().norm()
+            assert err < 0.02, f"{key}: relative error {err:.4f} vs the bf16 original"
+    plan = plan_modules(adapters, cfg)
+    assert len(plan) == len(plan_modules(split_ptd_state_dict(dict(sd), meta)[0], cfg))
+
+
+@test
+def test_int8_storage_guards():
+    sd, meta = synth_adapters()
+    q_sd, q_meta = to_int8({k: v.clone() for k, v in sd.items()}, meta)
+    key = next(k for k in q_sd if k.endswith(".lora_down"))
+
+    def refused(state, metadata, needle):
+        try:
+            split_ptd_state_dict(dict(state), metadata)
+        except ValueError as e:
+            assert needle in str(e), f"wrong refusal: {e}"
+            return
+        raise AssertionError(f"accepted a file that should be refused ({needle})")
+
+    refused({k: v for k, v in q_sd.items() if k != key + "_scale"}, q_meta, "has no")
+    refused({**q_sd, key: sd[key]}, q_meta, "carries a")
+    refused({**q_sd, "transformer_blocks.9.attn.to_q.lora_down_scale": torch.ones(H, R)},
+            q_meta, "unrecognized")
+    refused(q_sd, meta, "no ptd_compact")
+    refused(q_sd, dict(q_meta, ptd_compact='{"schema": 2}'), "unsupported ptd_compact")
+    bad = dict(q_sd)
+    bad[key + "_scale"] = bad[key + "_scale"][:, :-1]
+    refused(bad, q_meta, "one per row")
+    assert split_ptd_state_dict(dict(sd), meta)[2]["storage"] == "bf16"
+
+
+@test
+def test_real_int8_file_plan_is_208_modules():
+    if not os.path.exists(PTD_INT8_FILE):
+        SKIP.append("real_int8_file_plan (int8 PTD file missing)")
+        return
+    with open(PTD_INT8_FILE, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+    meta = hdr.pop("__metadata__", {})
+    dt = {"I8": torch.int8, "F32": torch.float32, "BF16": torch.bfloat16}
+    sd = {k: torch.zeros(v["shape"], dtype=dt[v["dtype"]]) for k, v in hdr.items()}
+    adapters, _heads, cfg = split_ptd_state_dict(sd, meta, PTD_INT8_FILE)
+    assert cfg["storage"].startswith("int8"), cfg["storage"]
+    plan = plan_modules(adapters, cfg, PTD_INT8_FILE)
+    assert len(plan) == 50 * 4 + 2 * 4, len(plan)
+    q = next(e for e in plan if e["path"] == "blocks.0.attn.qkv_proj")
+    assert list(q["flat"][0].shape) == [cfg["hops"], 3 * cfg["rank"], 5376], q["flat"][0].shape
+
+
 if __name__ == "__main__":
     failed = 0
     for fn in TESTS:

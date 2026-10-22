@@ -107,8 +107,9 @@ class MiniMaxH3PTDApply:
             "required": {
                 "model": ("MODEL",),
                 "ptd_file": (folder_paths.get_filename_list("ptd"),
-                             {"tooltip": "MiniMax-H3-Ref2VA-PTD-{8,4}Step.safetensors in "
-                                         "models/ptd/. nfe is read from the file."}),
+                             {"tooltip": "MiniMax-H3-Ref2VA-PTD-{8,4}Step.safetensors (bf16) or "
+                                         "nynxz's ptd_h3_ref2va_*_int8 files in models/ptd/. "
+                                         "nfe is read from the file."}),
                 "lora_strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0,
                                             "step": 0.01}),
                 "head_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
@@ -261,7 +262,7 @@ class MiniMaxH3PTDApply:
         sigmas = _sigmas_tensor(bounds)
         info = (
             f"{nfe_note}{off_env_note}"
-            f"PTD: {ptd_file}\n"
+            f"PTD: {ptd_file} ({config['storage']})\n"
             f"grid {num_steps} fine steps -> {hops} hops x block {trained_block} trained; "
             f"running nfe {len(sizes)} blocks {','.join(map(str, sizes))} "
             f"-> hops {','.join(map(str, hop_of_block))}"
