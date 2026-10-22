@@ -25,8 +25,8 @@ try:
         partition_off_envelope, resolve_partition, validate_sigma_shifts,
     )
     from .ptd_core import (
-        PTDStack, attach_ptd_sidecar, hop_map, make_ptd_wrapper, plan_modules,
-        split_ptd_state_dict,
+        PTDStack, attach_ptd_sidecar, hop_map, make_ptd_wrapper, make_raw_text_preprocess,
+        plan_modules, split_ptd_state_dict,
     )
 except ImportError:
     from pdd_heads import (
@@ -35,8 +35,8 @@ except ImportError:
         partition_off_envelope, resolve_partition, validate_sigma_shifts,
     )
     from ptd_core import (
-        PTDStack, attach_ptd_sidecar, hop_map, make_ptd_wrapper, plan_modules,
-        split_ptd_state_dict,
+        PTDStack, attach_ptd_sidecar, hop_map, make_ptd_wrapper, make_raw_text_preprocess,
+        plan_modules, split_ptd_state_dict,
     )
 
 WRAPPER_KEY = "minimax_h3_ptd"
@@ -218,6 +218,13 @@ class MiniMaxH3PTDApply:
                     f"model final_layer.{name} {list(native.shape)}. PTD brings its own head "
                     f"bank, so it needs a CLEAN ref2va trunk -- not a '..._baked_with_heads_...' "
                     f"checkpoint that already carries one.")
+        # Audio needs NO chord/tangent correction here (taobao's and the compact pack's
+        # schedule.audio_head_corrections): those run audio on ComfyUI-PTD's tangent clock.
+        # core carries audio as (sigma_v/sigma_a)*x_audio, which makes a plain euler step land
+        # exactly on the chord the mean-velocity head was trained for -- porting the factor
+        # would double-correct (tests/test_e2e.py). The 1.0-endpoint grid is also the trained
+        # one: taobao's README says Diffusers and training use 1.0; ComfyUI-PTD's 0.999 is
+        # its own clock, not the checkpoint's.
         vW, vB = fuse_heads(vw, vb, fine_sigmas(VIDEO_SHIFT, num_steps), sizes)
         aW, aB = fuse_heads(aw, ab, fine_sigmas(AUDIO_SHIFT, num_steps), sizes)
         heads = HeadBank(vW, vB, aW, aB)
@@ -233,6 +240,12 @@ class MiniMaxH3PTDApply:
         else:
             stack = PTDStack(plan, hops, residency=residency, pin=pin_memory)
             _, sidecar_note = attach_ptd_sidecar(m, plan, stack, lora_strength)
+            if any(e["path"].startswith("token_refiner.") for e in plan):
+                # see "The refiner trap" in ptd_core.py
+                m.add_object_patch(
+                    "diffusion_model.preprocess_text_embeds",
+                    make_raw_text_preprocess(m.get_model_object("diffusion_model").hidden_size))
+                sidecar_note += "; token_refiner runs per hop (raw text kept for the forward)"
 
         m.add_object_patch(
             "diffusion_model.final_layer.forward",

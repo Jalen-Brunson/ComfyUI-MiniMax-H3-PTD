@@ -38,6 +38,17 @@ on the module routes it back through `linear(_eager_input_act(x, "swiglu"))`, so
 our forward runs and receives the post-SwiGLU activation (which is exactly what
 diffusers' `ff.net.2` consumes). Cost is the fused epilogue on fc2 only.
 qkv_proj / out_proj / fc1 are all plain module calls and need no such treatment.
+
+The refiner trap
+----------------
+core refines the prompt ONCE per sampling run, in model_base.extra_conds
+(`preprocess_text_embeds` = condition_proj + token_refiner), before the first
+step -- outside the DIFFUSION_MODEL wrapper, so no hop is armed and the 8
+token_refiner sidecars return the base output. Every step then reused that
+base-refined text. Fix: keep the raw Qwen states through extra_conds
+(make_raw_text_preprocess); core's _embed_and_pack refines raw text itself,
+inside every forward, where the hop is armed. Same remedy as ComfyUI-PTD
+(ptd_comfy/patcher.py `raw_text`). Cost: two refiner blocks per model call.
 """
 from __future__ import annotations
 
@@ -396,6 +407,25 @@ def attach_ptd_sidecar(m, plan, stack, strength, logger=logging):
             f"({forced} fc2 forced through forward), {stack.describe()}")
     logger.info("MiniMaxH3PTDApply: %s", note)
     return len(plan), note
+
+
+def make_raw_text_preprocess(hidden_size, logger=logging):
+    """Replacement for `diffusion_model.preprocess_text_embeds`: pass raw text through.
+
+    See "The refiner trap". Already-refined states (hidden_size wide) cannot be
+    un-refined; they pass through unchanged, exactly as core's own method does,
+    with one warning that the refiner adapters cannot reach them.
+    """
+    warned = []
+
+    def preprocess_text_embeds(text_states):
+        if text_states.shape[-1] == hidden_size and not warned:
+            warned.append(True)
+            logger.warning("MiniMaxH3PTDApply: text conditioning arrived already refined; the "
+                           "per-hop token_refiner adapters cannot apply to it.")
+        return text_states
+
+    return preprocess_text_embeds
 
 
 def hop_map(sizes, trained_block, hops):

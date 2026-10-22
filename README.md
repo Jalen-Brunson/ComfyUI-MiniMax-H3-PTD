@@ -122,7 +122,7 @@ load time.
 
 ## Implementation notes
 
-Two things in core will silently break a naive implementation, and are worth knowing if you are
+Three things in core will silently break a naive implementation, and are worth knowing if you are
 writing something similar:
 
 **`fc2` never calls its own `forward`.** Core's MLP is
@@ -139,6 +139,23 @@ reproduces the bypass rather than mocking it.
 per-module, inside each sidecar forward where the input tensor is unambiguous — which is also
 offload- and multi-device-safe — with the wrapper only doing a best-effort eager bind.
 
+**The prompt is refined before any hop is armed.** Core runs `condition_proj` + `token_refiner`
+once per sampling run, in `model_base.extra_conds`, outside the `DIFFUSION_MODEL` wrapper. The 8
+`token_refiner` adapters (2 blocks x 4) then see no armed hop and return the base output, so every
+step reuses base-refined text — silently. The node keeps the raw Qwen states through `extra_conds`
+(an object patch on `preprocess_text_embeds`, the same remedy as ComfyUI-PTD); core's
+`_embed_and_pack` refines raw text itself, inside every forward, under the armed hop. Cost: two
+refiner blocks per model call. Fixed 2026-10-22.
+
+**Audio needs no chord correction here, and the schedule starts at 1.0.** The ComfyUI-PTD-based
+ports (taobao's own node, ComfyUI-PTD-Compact) multiply the audio head by
+`schedule.audio_head_corrections` because ComfyUI-PTD converts audio to the video clock with its
+*tangent*. Core instead carries audio as `(sigma_v / sigma_a) * x_audio`, which makes a plain euler
+step land exactly on the *chord* the block-mean head was trained for (`test_core_audio_step_is_the_trained_chord`
+calls core's real `forward`) — porting the factor would double-correct. Those ports also run on
+ComfyUI-PTD's 0.999-endpoint clock; taobao's README says Diffusers and training use endpoint 1.0,
+which is this node's grid.
+
 Other mapping details, all shared with the PDD Acc pack: core fuses q/k/v into one `qkv_proj`
 (three branches are computed against one stacked down-projection and written into their own slices
 of the fused output — exact, and cheaper than a block-diagonal rank-3r form), and core's
@@ -154,9 +171,15 @@ re-vendor.
 
 ```bash
 PYTHONPATH=/path/to/ComfyUI python3 tests/test_ptd.py
+PYTHONPATH=/path/to/ComfyUI python3 tests/test_e2e.py
 ```
 
-16 tests. The strongest builds a real core `RefinerBlock` and compares the sidecar against the same
+`test_e2e.py` (4 tests, CPU) runs the node's MODEL on a tiny real native MiniMax-H3 through core's
+own `extra_conds` -> euler -> `forward` path: the refiner runs once per hop and matches the merged
+weights of that hop, the unpatched path refines once with no adapters (the trap, pinned), core's
+carried-audio step equals the chord, and the fused head plans match the compact pack's.
+
+`test_ptd.py` (20 tests): the strongest builds a real core `RefinerBlock` and compares the sidecar against the same
 block with `B@A` **merged into its weights** — merging being the definition of applying a LoRA — so
 agreement proves fused-qkv row order, the fc1 half-swap, the fc2 path and hop selection at once
 (with a guard that the LoRA is not a no-op). Also covered: streamed ≡ resident bit-for-bit,
